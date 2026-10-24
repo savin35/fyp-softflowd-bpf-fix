@@ -1,0 +1,13 @@
+diff --git a/softflowd.c b/softflowd.c
+index fee489b..b21a4ac 100644
+--- a/softflowd.c
++++ b/softflowd.c
+@@ -1575,7 +1575,7 @@ setup_packet_capture (struct pcap **pcap, int *linktype,
+   if (dev != NULL) {
+     if (!snaplen)
+       snaplen = need_v6 ? LIBPCAP_SNAPLEN_V6 : LIBPCAP_SNAPLEN_V4;
+-    if ((*pcap = pcap_open_live (dev, snaplen, 1, 0, ebuf)) == NULL) {
++    if ((*pcap = pcap_open_live (dev, snaplen, 1, 1000, ebuf)) == NULL) {
+       fprintf (stderr, "pcap_open_live: %s\n", ebuf);
+       exit (1);
+     }
