@@ -21,29 +21,56 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p vm evidence
-          BASE='https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest'
-          IMAGE='FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz'
-          curl --fail --location --retry 3 "$BASE/$IMAGE" -o "vm/$IMAGE"
-          curl --fail --location --retry 3 "$BASE/CHECKSUM.SHA256" -o vm/CHECKSUM.SHA256
-          # FreeBSD CHECKSUM.SHA256 commonly uses SHA256 (filename) = digest.
-          # Verify against the official digest without assuming its presentation format.
+
+          BASE="https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest"
+
+          curl -fsSL --retry 3 \
+            "$BASE/CHECKSUM.SHA256" \
+            -o vm/CHECKSUM.SHA256
+
           python3 - <<'PY'
-          import hashlib, pathlib, re, sys
-          p=pathlib.Path('vm/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz')
-          data=pathlib.Path('vm/CHECKSUM.SHA256').read_text()
-          match=next((line for line in data.splitlines() if p.name in line), None)
-          if not match:
-              sys.exit('Official checksum listing does not contain downloaded image')
-          hashes=re.findall(r'\b[0-9a-fA-F]{64}\b', match)
-          if len(hashes)!=1:
-              sys.exit('Cannot uniquely parse official SHA256 line: '+match)
-          expected=hashes[0].lower()
-          actual=hashlib.file_digest(p.open('rb'),'sha256').hexdigest()
-          assert actual==expected, f'SHA256 mismatch: {actual} != {expected}'
-          pathlib.Path('evidence/image-sha256.txt').write_text(f'{p.name}  {actual}\n')
-          print('Verified official SHA256:',actual)
+          import pathlib, re
+
+          data = pathlib.Path("vm/CHECKSUM.SHA256").read_text()
+          matches = re.findall(
+              r"^SHA256 \((FreeBSD-16\.0-CURRENT-amd64-BASIC-CLOUDINIT-[^)]+-ufs\.qcow2\.xz)\) = ([0-9a-fA-F]{64})$",
+              data,
+              re.MULTILINE,
+          )
+
+          if len(matches) != 1:
+              raise SystemExit(f"Expected exactly one UFS cloud image, found {len(matches)}")
+
+          filename, digest = matches[0]
+          pathlib.Path("vm/image-name.txt").write_text(filename)
+          pathlib.Path("vm/expected-sha256.txt").write_text(digest.lower())
+          print("Selected verified image:", filename)
           PY
+
+          IMAGE="$(cat vm/image-name.txt)"
+
+          curl -fsSL --retry 3 \
+            "$BASE/$IMAGE" -o "vm/$IMAGE"
+
+          python3 - <<'PY'
+          import hashlib, pathlib
+
+          name = pathlib.Path("vm/image-name.txt").read_text()
+          expected = pathlib.Path("vm/expected-sha256.txt").read_text()
+          with open(pathlib.Path("vm") / name, "rb") as f:
+              actual = hashlib.file_digest(f, "sha256").hexdigest()
+
+          if actual != expected:
+              raise SystemExit("SHA256 verification failed")
+
+          print("SHA256 verification successful")
+          pathlib.Path("evidence/image-sha256.txt").write_text(
+              f"{name}  {actual}\n"
+          )
+          PY
+
           xz -d "vm/$IMAGE"
+
           qemu-img info vm/*.qcow2 | tee evidence/image-info.txt
 
       - name: Create temporary cloud-init SSH credentials
