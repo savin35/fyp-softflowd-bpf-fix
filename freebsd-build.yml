@@ -1,0 +1,51 @@
+name: Experimental FreeBSD softflowd build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-freebsd15:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+
+      - name: Retrieve exact upstream source and apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch softflowd-1.0.0 https://github.com/irino/softflowd.git upstream-softflowd
+          test "$(git -C upstream-softflowd rev-parse HEAD)" = "9cf249ebc18745a59418a62de124ff3975b59a01"
+          git -C upstream-softflowd apply ../patches/softflowd-bpf-timeout-1000ms.patch
+          git -C upstream-softflowd diff --check
+          grep -F 'pcap_open_live (dev, snaplen, 1, 1000, ebuf)' upstream-softflowd/softflowd.c
+
+      - name: Compile within experimental FreeBSD 15 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.0'
+          mem: '2048'
+          prepare: |
+            pkg install -y autoconf automake libtool gmake
+          run: |
+            set -eu
+            cd upstream-softflowd
+            autoreconf -fi
+            ./configure
+            gmake -j2
+            test -x ./softflowd
+            file ./softflowd
+            ldd ./softflowd
+            cp ./softflowd ../softflowd-experimental-freebsd15
+
+      - name: Save experimental build
+        uses: actions/upload-artifact@v4
+        with:
+          name: softflowd-experimental-freebsd15-NOT-PFSENSE
+          path: softflowd-experimental-freebsd15
+          if-no-files-found: error
+          retention-days: 7
