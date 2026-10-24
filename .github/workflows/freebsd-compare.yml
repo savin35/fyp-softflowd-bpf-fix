@@ -28,7 +28,7 @@ jobs:
           release: '15.0'
           mem: '2048'
           prepare: |
-            pkg install -y autoconf automake libtool gmake
+            pkg install -y autoconf automake libtool gmake git
           run: |
             set -eu
             mkdir -p results
