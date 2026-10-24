@@ -50,7 +50,8 @@ jobs:
           IMAGE="$(cat vm/image-name.txt)"
 
           curl -fsSL --retry 3 \
-            "$BASE/$IMAGE" -o "vm/$IMAGE"
+          "$BASE/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" \
+          -o "vm/$IMAGE"
 
           python3 - <<'PY'
           import hashlib, pathlib
