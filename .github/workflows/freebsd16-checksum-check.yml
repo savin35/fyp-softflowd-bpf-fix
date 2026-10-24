@@ -1,0 +1,30 @@
+
+name: Inspect FreeBSD 16 Checksums
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect official checksum listing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest"
+
+          curl -fsSL --retry 3 \
+            "$BASE/CHECKSUM.SHA256" \
+            -o checksums.txt
+
+          echo "=== First 40 lines ==="
+          sed -n '1,40p' checksums.txt
+
+          echo "=== Cloud image entries ==="
+          grep -iE 'cloudinit|qcow2|xz' checksums.txt || true
