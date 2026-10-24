@@ -1,0 +1,110 @@
+name: FreeBSD 16 experimental VM smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boot-freebsd16:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install VM utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils openssh-client xz-utils
+
+      - name: Download verified official FreeBSD 16 snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vm evidence
+          BASE='https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest'
+          IMAGE='FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz'
+          curl --fail --location --retry 3 "$BASE/$IMAGE" -o "vm/$IMAGE"
+          curl --fail --location --retry 3 "$BASE/CHECKSUM.SHA256" -o vm/CHECKSUM.SHA256
+          # FreeBSD CHECKSUM.SHA256 commonly uses SHA256 (filename) = digest.
+          # Verify against the official digest without assuming its presentation format.
+          python3 - <<'PY'
+          import hashlib, pathlib, re, sys
+          p=pathlib.Path('vm/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz')
+          data=pathlib.Path('vm/CHECKSUM.SHA256').read_text()
+          match=next((line for line in data.splitlines() if p.name in line), None)
+          if not match:
+              sys.exit('Official checksum listing does not contain downloaded image')
+          hashes=re.findall(r'\b[0-9a-fA-F]{64}\b', match)
+          if len(hashes)!=1:
+              sys.exit('Cannot uniquely parse official SHA256 line: '+match)
+          expected=hashes[0].lower()
+          actual=hashlib.file_digest(p.open('rb'),'sha256').hexdigest()
+          assert actual==expected, f'SHA256 mismatch: {actual} != {expected}'
+          pathlib.Path('evidence/image-sha256.txt').write_text(f'{p.name}  {actual}\n')
+          print('Verified official SHA256:',actual)
+          PY
+          xz -d "vm/$IMAGE"
+          qemu-img info vm/*.qcow2 | tee evidence/image-info.txt
+
+      - name: Create temporary cloud-init SSH credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f vm/ephemeral_key
+          PUBKEY="$(cat vm/ephemeral_key.pub)"
+          cat > vm/user-data <<EOF
+          #cloud-config
+          users:
+            - default
+            - name: fypbuild
+              shell: /bin/sh
+              groups: wheel
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              ssh_authorized_keys:
+                - $PUBKEY
+          ssh_pwauth: false
+          disable_root: true
+          EOF
+          printf 'instance-id: fyp-freebsd16-smoke-1\nlocal-hostname: fyp-freebsd16\n' > vm/meta-data
+          cloud-localds vm/seed.iso vm/user-data vm/meta-data
+
+      - name: Boot FreeBSD 16 and verify SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          qemu-system-x86_64 \
+            -machine accel=tcg -cpu max -smp 2 -m 2048 \
+            -drive file="$(echo vm/*.qcow2)",if=virtio,format=qcow2 \
+            -drive file=vm/seed.iso,media=cdrom,readonly=on \
+            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:10022-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -nographic -serial file:evidence/guest-console.log \
+            -monitor none -daemonize
+          success=0
+          for attempt in $(seq 1 90); do
+            if ssh -i vm/ephemeral_key -p 10022 -o StrictHostKeyChecking=no \
+               -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3 \
+               fypbuild@127.0.0.1 'freebsd-version -kru; uname -a' \
+               > evidence/guest-version.txt 2> evidence/ssh-last-error.txt; then
+              success=1
+              break
+            fi
+            sleep 5
+          done
+          echo '=== Guest version ==='
+          cat evidence/guest-version.txt 2>/dev/null || true
+          echo '=== Console tail ==='
+          tail -n 50 evidence/guest-console.log || true
+          if [ "$success" -ne 1 ]; then
+            echo 'FreeBSD 16 guest did not become SSH-accessible; inspect uploaded evidence.' >&2
+            exit 1
+          fi
+
+      - name: Upload non-sensitive diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd16-smoke-test-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
