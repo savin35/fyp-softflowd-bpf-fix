@@ -1,0 +1,86 @@
+name: Compare original vs patched softflowd on FreeBSD 15
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-freebsd15:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+
+      - name: Fetch verified upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch softflowd-1.0.0 https://github.com/irino/softflowd.git upstream-softflowd
+          test "$(git -C upstream-softflowd rev-parse HEAD)" = "9cf249ebc18745a59418a62de124ff3975b59a01"
+          git -C upstream-softflowd apply --check ../patches/softflowd-bpf-timeout-1000ms.patch
+
+      - name: Build and compare in isolated FreeBSD 15 VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.0'
+          mem: '2048'
+          prepare: |
+            pkg install -y autoconf automake libtool gmake
+          run: |
+            set -eu
+            mkdir -p results
+            cd upstream-softflowd
+            autoreconf -fi
+            ./configure
+            gmake -j2
+            cp ./softflowd ../results/softflowd-original-freebsd15
+            git apply ../patches/softflowd-bpf-timeout-1000ms.patch
+            grep -F 'pcap_open_live (dev, snaplen, 1, 1000, ebuf)' softflowd.c
+            gmake -j2
+            cp ./softflowd ../results/softflowd-patched-freebsd15
+            cd ..
+            ./upstream-softflowd/softflowctl -h > results/softflowctl-help.txt 2>&1 || true
+            echo "FreeBSD release: $(freebsd-version -u)" | tee results/platform.txt
+            uname -a >> results/platform.txt
+            for variant in original patched; do
+              echo "===== Testing $variant ====="
+              binary="$(pwd)/results/softflowd-$variant-freebsd15"
+              ctl="/tmp/fyp-softflowd-$variant.ctl"
+              pidfile="/tmp/fyp-softflowd-$variant.pid"
+              logfile="results/$variant.log"
+              rm -f "$ctl" "$pidfile"
+              # A test instance on the FreeBSD VM loopback interface only.
+              "$binary" -i lo0 -n 127.0.0.1:4739 -v 10 -T full \
+                -t general=5 -t icmp=5 -t udp=5 -t tcp=5 \
+                -t maxlife=10 -t expint=2 -p "$pidfile" -c "$ctl" > "$logfile" 2>&1 || true
+              sleep 2
+              echo '--- Initial statistics ---' | tee -a "$logfile"
+              ./upstream-softflowd/softflowctl -c "$ctl" statistics >> "$logfile" 2>&1 || true
+              # Equal small workload to test low-traffic capture delivery.
+              ping -c 3 -i 1 127.0.0.1 >> "$logfile" 2>&1 || true
+              sleep 8
+              echo '--- After 8 seconds ---' | tee -a "$logfile"
+              ./upstream-softflowd/softflowctl -c "$ctl" statistics >> "$logfile" 2>&1 || true
+              echo '--- Socket status ---' >> "$logfile"
+              sockstat -u -l >> "$logfile" 2>&1 || true
+              if [ -f "$pidfile" ]; then
+                kill -TERM "$(cat "$pidfile")" 2>/dev/null || true
+                sleep 2
+              fi
+              echo "===== Result for $variant ====="
+              cat "$logfile"
+            done
+            file results/softflowd-* > results/file-types.txt
+            ldd results/softflowd-patched-freebsd15 > results/ldd-patched.txt
+
+      - name: Upload test evidence (not for pfSense installation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd15-original-vs-patched-experiment-NOT-PFSENSE
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
