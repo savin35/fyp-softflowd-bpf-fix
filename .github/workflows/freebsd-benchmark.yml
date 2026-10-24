@@ -1,0 +1,122 @@
+name: Benchmark softflowd capture timeout on FreeBSD 15
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark-freebsd15:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out experimental patch
+        uses: actions/checkout@v4
+
+      - name: Fetch verified upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch softflowd-1.0.0 https://github.com/irino/softflowd.git upstream-softflowd
+          test "$(git -C upstream-softflowd rev-parse HEAD)" = "9cf249ebc18745a59418a62de124ff3975b59a01"
+          git -C upstream-softflowd apply --check ../patches/softflowd-bpf-timeout-1000ms.patch
+
+      - name: Repeat original-versus-patched trials inside FreeBSD 15
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.0'
+          mem: '2048'
+          prepare: |
+            pkg install -y autoconf automake libtool gmake git
+          run: |
+            set -eu
+            mkdir -p results/logs
+            cd upstream-softflowd
+            autoreconf -fi
+            ./configure
+            gmake -j2
+            cp ./softflowd ../results/softflowd-original-freebsd15
+            git apply ../patches/softflowd-bpf-timeout-1000ms.patch
+            grep -F 'pcap_open_live (dev, snaplen, 1, 1000, ebuf)' softflowd.c
+            gmake -j2
+            cp ./softflowd ../results/softflowd-patched-freebsd15
+            cd ..
+            {
+              freebsd-version -u
+              uname -a
+              date -u
+            } > results/platform.txt
+            echo 'trial,variant,seconds_after_ping,packets_received,packets_processed,flow_records_exported,control_ok' > results/samples.csv
+            echo 'trial,variant,packets_processed_at_8s,packet_records_exported_at_8s,control_ok_at_8s' > results/summary.csv
+
+            # Each trial starts a fresh daemon, then sends the same three ICMP pings.
+            # Alternating order limits bias from warming/caching and VM scheduling.
+            run_trial() {
+              trial="$1"
+              variant="$2"
+              binary="$(pwd)/results/softflowd-$variant-freebsd15"
+              ctl="/tmp/fyp-benchmark-$variant-$trial.ctl"
+              pidfile="/tmp/fyp-benchmark-$variant-$trial.pid"
+              prefix="results/logs/$trial-$variant"
+              rm -f "$ctl" "$pidfile"
+              "$binary" -i lo0 -n 127.0.0.1:4739 -v 10 -T full \
+                -t general=5 -t icmp=5 -t udp=5 -t tcp=5 \
+                -t maxlife=10 -t expint=2 -p "$pidfile" -c "$ctl" > "$prefix-daemon.log" 2>&1
+              sleep 2
+              ping -c 3 -i 1 127.0.0.1 > "$prefix-ping.log" 2>&1
+              elapsed=0
+              last_processed=NA
+              last_exported=NA
+              last_ok=0
+              for checkpoint in 1 2 4 8; do
+                sleep $((checkpoint - elapsed))
+                elapsed="$checkpoint"
+                sample="$prefix-at-${checkpoint}s.txt"
+                if ./upstream-softflowd/softflowctl -c "$ctl" statistics > "$sample" 2>&1; then
+                  control_ok=1
+                else
+                  control_ok=0
+                fi
+                received="$(awk -F: '/^Packets received by libpcap:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$sample")"
+                processed="$(awk -F: '/^Packets processed:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$sample")"
+                exported="$(awk '/^Flows exported:/{for(i=1;i<=NF;i++) if ($i ~ /^\([0-9]+$/) {gsub(/[^0-9]/,"",$i); print $i; exit}}' "$sample")"
+                received="${received:-NA}"
+                processed="${processed:-NA}"
+                exported="${exported:-NA}"
+                echo "$trial,$variant,$checkpoint,$received,$processed,$exported,$control_ok" >> results/samples.csv
+                last_processed="$processed"
+                last_exported="$exported"
+                last_ok="$control_ok"
+              done
+              echo "$trial,$variant,$last_processed,$last_exported,$last_ok" >> results/summary.csv
+              if [ -f "$pidfile" ]; then
+                kill -TERM "$(cat "$pidfile")" 2>/dev/null || true
+              fi
+              sleep 1
+              rm -f "$ctl" "$pidfile"
+            }
+
+            for trial in 1 2 3 4 5; do
+              case "$trial" in
+                1|3|5) first=original; second=patched ;;
+                *) first=patched; second=original ;;
+              esac
+              run_trial "$trial" "$first"
+              run_trial "$trial" "$second"
+            done
+            echo '==== Per-trial results ===='
+            cat results/summary.csv
+            echo '==== Timed samples ===='
+            cat results/samples.csv
+            file results/softflowd-* > results/file-types.txt
+            ldd results/softflowd-patched-freebsd15 > results/ldd-patched.txt
+
+      - name: Upload experiment evidence (NOT for pfSense installation)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd15-repeated-bpf-benchmark-NOT-PFSENSE
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
