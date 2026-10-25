@@ -131,7 +131,7 @@ jobs:
             -drive file=vm/guest.qcow2,if=virtio,format=qcow2 \
             -drive file=vm/seed.iso,media=cdrom,readonly=on \
             -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
-            -display none -serial file=evidence/guest-console.log \
+            -display none -serial file:evidence/guest-console.log \
             -monitor none -daemonize
           for attempt in $(seq 1 360); do
             if [ -s evidence/result.txt ]; then
