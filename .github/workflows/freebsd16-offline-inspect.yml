@@ -1,0 +1,78 @@
+name: Inspect FreeBSD 16 image before first boot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install offline image inspection utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils libguestfs-tools xz-utils
+
+      - name: Download and verify FreeBSD 16 cloud image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vm evidence
+          BASE='https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest'
+          curl -fsSL --retry 3 "$BASE/CHECKSUM.SHA256" -o vm/CHECKSUM.SHA256
+          python3 - <<'PY'
+          import pathlib, re
+          checksums = pathlib.Path('vm/CHECKSUM.SHA256').read_text()
+          matched = re.findall(r'^SHA256 \((FreeBSD-16\.0-CURRENT-amd64-BASIC-CLOUDINIT-[^)]*-ufs\.qcow2\.xz)\) = ([0-9a-fA-F]{64})$', checksums, flags=re.M)
+          if len(matched) != 1:
+              raise SystemExit(f'Expected one cloud UFS image checksum; found {len(matched)}')
+          filename, checksum = matched[0]
+          pathlib.Path('vm/image-name').write_text(filename)
+          pathlib.Path('vm/sha256-expected').write_text(checksum.lower())
+          print('Official image listing:', filename)
+          PY
+          IMAGE="$(cat vm/image-name)"
+          curl -fsSL --retry 3 "$BASE/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" -o "vm/$IMAGE"
+          python3 - <<'PY'
+          import hashlib, pathlib
+          name = pathlib.Path('vm/image-name').read_text()
+          expected = pathlib.Path('vm/sha256-expected').read_text()
+          with (pathlib.Path('vm')/name).open('rb') as source:
+              actual = hashlib.file_digest(source, 'sha256').hexdigest()
+          if actual != expected:
+              raise SystemExit(f'Image checksum mismatch: expected {expected}, got {actual}')
+          pathlib.Path('evidence/checksum.txt').write_text(f'{name} SHA256 {actual}\n')
+          print('SHA256 verified')
+          PY
+          xz -d "vm/$IMAGE"
+          qemu-img info vm/*.qcow2 > evidence/image-info.txt
+
+      - name: Inspect guest filesystems and first-boot configuration read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$(echo vm/*.qcow2)"
+          export LIBGUESTFS_BACKEND=direct
+          echo '=== Detect guest operating system ===' | tee evidence/inspection.txt
+          virt-inspector -a "$IMAGE" >> evidence/inspection.txt 2>&1 || true
+          echo '=== Filesystems ===' | tee -a evidence/inspection.txt
+          virt-filesystems --all --long -a "$IMAGE" >> evidence/inspection.txt 2>&1 || true
+          echo '=== Read-only guestfish filesystem detection ===' | tee -a evidence/inspection.txt
+          guestfish --ro -a "$IMAGE" run : list-filesystems >> evidence/inspection.txt 2>&1 || true
+          echo '=== Read-only rc.conf inspection (may be unsupported for FreeBSD UFS) ===' | tee -a evidence/inspection.txt
+          virt-cat -a "$IMAGE" /etc/rc.conf >> evidence/inspection.txt 2>&1 || true
+          echo '=== Relevant offline findings ==='
+          grep -Ei 'firstboot|FreeBSD|ufs|root|rc.conf|mount|fail|error|not supported' evidence/inspection.txt | tail -n 80 || true
+          echo 'Inspection complete; no guest disk writes performed.'
+
+      - name: Upload offline inspection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd16-offline-firstboot-inspection
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: warn
