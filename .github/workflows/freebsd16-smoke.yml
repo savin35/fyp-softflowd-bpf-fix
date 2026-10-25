@@ -106,7 +106,7 @@ jobs:
             -drive file=vm/seed.iso,media=cdrom,readonly=on \
             -netdev user,id=net0,hostfwd=tcp:127.0.0.1:10022-:22 \
             -device virtio-net-pci,netdev=net0 \
-            -nographic -serial file:evidence/guest-console.log \
+            -display none -serial file:evidence/guest-console.log \
             -monitor none -daemonize
           success=0
           for attempt in $(seq 1 90); do
