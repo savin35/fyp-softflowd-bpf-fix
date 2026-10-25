@@ -1,0 +1,122 @@
+
+name: Diagnose FreeBSD 16 boot from serial console
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  serial-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install QEMU and checksum tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils xz-utils
+
+      - name: Fetch and verify official FreeBSD 16 cloud image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vm evidence
+          BASE=https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest
+          curl -fsSL --retry 3 "$BASE/CHECKSUM.SHA256" -o vm/checksums.txt
+          python3 - <<'PY'
+          import re, pathlib
+          listing = pathlib.Path('vm/checksums.txt').read_text()
+          found = re.findall(r'^SHA256 \((FreeBSD-16\.0-CURRENT-amd64-BASIC-CLOUDINIT-[^)]+-ufs\.qcow2\.xz)\) = ([0-9a-fA-F]{64})$', listing, re.M)
+          if len(found) != 1:
+              raise SystemExit(f'Expected exactly one FreeBSD 16 UFS cloud image; found {len(found)}')
+          name, digest = found[0]
+          pathlib.Path('vm/image-name').write_text(name)
+          pathlib.Path('vm/expected-digest').write_text(digest.lower())
+          print('Official snapshot:', name)
+          PY
+          IMAGE="$(cat vm/image-name)"
+          # The current FreeBSD snapshot mirror serves the image using an unversioned alias.
+          curl -fsSL --retry 3 "$BASE/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" -o "vm/$IMAGE"
+          python3 - <<'PY'
+          import hashlib, pathlib
+          path = pathlib.Path('vm') / pathlib.Path('vm/image-name').read_text()
+          expected = pathlib.Path('vm/expected-digest').read_text()
+          with path.open('rb') as f:
+              actual = hashlib.file_digest(f, 'sha256').hexdigest()
+          if actual != expected:
+              raise SystemExit('Official checksum mismatch: stopping before boot')
+          pathlib.Path('evidence/verified-image.txt').write_text(f'{path.name}\nsha256={actual}\n')
+          print('Official SHA256 verified')
+          PY
+          xz -d "vm/$IMAGE"
+          qemu-img info vm/*.qcow2 > evidence/image-info.txt
+
+      - name: Boot isolated guest and capture entire serial console
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$(echo vm/*.qcow2)"
+          # No cloud-init credentials, and no SSH dependency for this diagnostic.
+          # Do not attach a seed ISO or expose the VM to the public internet.
+          qemu-system-x86_64 \
+            -machine accel=tcg -cpu max -smp 2 -m 2048 \
+            -drive "file=$IMAGE,if=virtio,format=qcow2,snapshot=on" \
+            -netdev user,id=net0,restrict=on \
+            -device virtio-net-pci,netdev=net0 \
+            -display none -serial file:evidence/guest-console.log \
+            -monitor none -daemonize
+          # Capture the full console through first boot, including service ordering.
+          # Wait up to 7 minutes, stopping once a login prompt appears.
+          found=0
+          for attempt in $(seq 1 84); do
+            if grep -Eq '(^|\r)login: ?$' evidence/guest-console.log 2>/dev/null; then
+              found=1
+              break
+            fi
+            sleep 5
+          done
+          printf 'login_prompt_seen=%s\n' "$found" > evidence/boot-status.txt
+          sleep 5
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('evidence/guest-console.log')
+          data = p.read_bytes().decode('utf-8', errors='replace') if p.exists() else ''
+          lines = data.splitlines()
+          terms = re.compile(r'firstboot|pkg.*upgrade|upgrading FreeBSD-|segmentation fault|sshd|cloud.?init|login:|rc\.conf|Starting|error|fail', re.I)
+          selected = [(i, line) for i, line in enumerate(lines) if terms.search(line)]
+          # Include up to three contextual lines before each firstboot/upgrade match.
+          keep = set()
+          for i, line in selected:
+              if re.search(r'firstboot|pkg.*upgrade|upgrading FreeBSD-|sshd|segmentation fault', line, re.I):
+                  keep.update(range(max(0, i-3), min(len(lines), i+2)))
+              else:
+                  keep.add(i)
+          excerpt = '\n'.join(f'{i+1:05d} {lines[i]}' for i in sorted(keep))
+          Path('evidence/service-timeline.txt').write_text(excerpt+'\n')
+          Path('evidence/diagnostic-summary.txt').write_text(
+              'console_bytes='+str(len(data.encode()))+'\n'
+              +'login_prompt='+str(bool(re.search(r'login:', data)))+'\n'
+              +'package_upgrade_lines='+str(len(re.findall(r'Upgrading FreeBSD-', data)))+'\n'
+              +'sshd_segfault='+str(bool(re.search(r'segmentation fault', data, re.I)))+'\n'
+              +'firstboot_mentions='+str(len(re.findall(r'firstboot', data, re.I)))+'\n'
+          )
+          print(Path('evidence/diagnostic-summary.txt').read_text())
+          print('--- Relevant first-boot timeline (last 90 lines) ---')
+          print('\n'.join(excerpt.splitlines()[-90:]))
+          PY
+          # A successful diagnostic requires actual guest console data and a login prompt.
+          test -s evidence/guest-console.log
+          test "$found" -eq 1
+
+      - name: Save boot diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd16-full-serial-boot-diagnostics
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
