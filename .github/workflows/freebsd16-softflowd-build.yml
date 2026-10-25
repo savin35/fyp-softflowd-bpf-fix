@@ -1,0 +1,165 @@
+name: Build experimental FreeBSD 16 softflowd (no SSH)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-freebsd16:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and cloud-init ISO creator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils xz-utils
+
+      - name: Verify image and prepare upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vm evidence serve
+          BASE=https://download.freebsd.org/ftp/snapshots/VM-IMAGES/16.0-CURRENT/amd64/Latest
+          curl -fsSL --retry 3 "$BASE/CHECKSUM.SHA256" -o vm/CHECKSUM.SHA256
+          python3 - <<'PYCODE'
+          import re, pathlib
+          data=pathlib.Path('vm/CHECKSUM.SHA256').read_text()
+          m=re.findall(r'^SHA256 \(FreeBSD-16\.0-CURRENT-amd64-BASIC-CLOUDINIT-[^)]+-ufs\.qcow2\.xz\) = ([a-fA-F0-9]{64})$',data,re.M)
+          if len(m)!=1: raise SystemExit(f'Expected one image checksum, got {len(m)}')
+          pathlib.Path('vm/expected').write_text(m[0].lower())
+          PYCODE
+          curl -fsSL --retry 3 "$BASE/FreeBSD-16.0-CURRENT-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" -o vm/guest.qcow2.xz
+          echo "$(cat vm/expected)  vm/guest.qcow2.xz" | sha256sum -c -
+          xz -d vm/guest.qcow2.xz
+          curl -fsSL --retry 3 https://github.com/irino/softflowd/archive/refs/tags/softflowd-1.0.0.tar.gz -o serve/softflowd.tar.gz
+          echo '98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108  serve/softflowd.tar.gz' | sha256sum -c -
+          cp patches/softflowd-bpf-timeout-1000ms.patch serve/softflowd.patch
+          cp vm/expected evidence/official-image-sha256.txt
+
+      - name: Launch local artifact receiver and guest bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > serve/fyp-build.sh <<'GUESTSCRIPT'
+          #!/bin/sh
+          set -u
+          exec > /dev/console 2>&1
+          say() { echo "FYPBUILD: $*"; }
+          post() {
+            f="$1"; dest="$2"
+            if [ -f "$f" ]; then
+              sz=$(wc -c < "$f" | tr -d ' ')
+              ( printf 'PUT /%s HTTP/1.1\r\nHost: 10.0.2.2\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "$dest" "$sz"; cat "$f" ) | nc -w 90 10.0.2.2 18080 >/dev/null 2>&1 || :
+            fi
+          }
+          mkdir -p /tmp/fyp
+          say 'START'
+          {
+            echo '=== Kernel ==='; uname -a
+            echo '=== Userland ==='; freebsd-version -kru || :
+            echo '=== Compiler ==='; cc --version || :
+            echo '=== pkg repositories ==='; pkg -vv | tail -n 70 || :
+          } > /tmp/fyp/system.txt 2>&1
+          post /tmp/fyp/system.txt system.txt
+          say 'Fetching verified source and patch from temporary host'
+          fetch -qo /tmp/fyp/softflowd.tar.gz http://10.0.2.2:18080/softflowd.tar.gz || exit 10
+          fetch -qo /tmp/fyp/softflowd.patch http://10.0.2.2:18080/softflowd.patch || exit 11
+          test "$(sha256 -q /tmp/fyp/softflowd.tar.gz)" = '98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108' || exit 12
+          mkdir -p /tmp/fyp/src
+          cd /tmp/fyp/src || exit 13
+          tar -xf /tmp/fyp/softflowd.tar.gz --strip-components 1 || exit 14
+          patch -p1 -i /tmp/fyp/softflowd.patch || exit 15
+          if ! grep -q 'pcap_open_live (dev, snaplen, 1, 1000, ebuf)' softflowd.c; then say 'PATCH_NOT_PRESENT'; exit 16; fi
+          say 'Installing build dependencies and compiling'
+          (
+            set -ex
+            pkg install -y gmake autoconf automake libtool pkgconf
+            autoreconf -fi
+            ./configure
+            gmake -j2
+            test -x ./softflowd
+            file ./softflowd
+            ldd ./softflowd
+            sha256 ./softflowd
+          ) > /tmp/fyp/build.log 2>&1
+          status=$?
+          echo "build_exit_code=$status" > /tmp/fyp/result.txt
+          post /tmp/fyp/build.log build.log
+          if [ "$status" -eq 0 ] && [ -x ./softflowd ]; then
+            post ./softflowd softflowd-freebsd16-EXPERIMENTAL
+            say 'BUILD_SUCCESS'
+          else
+            say "BUILD_FAILED status=$status"
+          fi
+          post /tmp/fyp/result.txt result.txt
+          say 'DONE'
+          GUESTSCRIPT
+          cat > serve/receiver.py <<'PYSERVER'
+          from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+          from pathlib import Path
+          import os
+          class Handler(SimpleHTTPRequestHandler):
+              def do_PUT(self):
+                  name = self.path.lstrip('/')
+                  if name not in {'system.txt','build.log','result.txt','softflowd-freebsd16-EXPERIMENTAL'}:
+                      self.send_error(400); return
+                  count=int(self.headers.get('Content-Length','0'))
+                  if count < 0 or count > 30000000:
+                      self.send_error(413); return
+                  Path('../evidence',name).write_bytes(self.rfile.read(count))
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'OK')
+          os.chdir('serve')
+          ThreadingHTTPServer(('0.0.0.0',18080), Handler).serve_forever()
+          PYSERVER
+          python3 serve/receiver.py > evidence/receiver.log 2>&1 &
+          echo $! > vm/receiver.pid
+          cat > vm/user-data <<'CLOUD'
+          #cloud-config
+          package_update: false
+          package_upgrade: false
+          runcmd:
+            - [ /bin/sh, -c, "fetch -qo /tmp/fyp-build.sh http://10.0.2.2:18080/fyp-build.sh && /bin/sh /tmp/fyp-build.sh" ]
+          CLOUD
+          printf 'instance-id: fyp-build-20261025\nlocal-hostname: fyp-build\n' > vm/meta-data
+          cloud-localds vm/seed.iso vm/user-data vm/meta-data
+          # QEMU user networking exposes the GitHub runner at 10.0.2.2 to the guest.
+          qemu-system-x86_64 \
+            -machine accel=tcg -cpu max -smp 2 -m 2048 \
+            -drive file=vm/guest.qcow2,if=virtio,format=qcow2 \
+            -drive file=vm/seed.iso,media=cdrom,readonly=on \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+            -display none -serial file=evidence/guest-console.log \
+            -monitor none -daemonize
+          for attempt in $(seq 1 360); do
+            if [ -s evidence/result.txt ]; then
+              break
+            fi
+            if (( attempt % 12 == 0 )); then
+              echo "Waiting for guest build... ${attempt}/360"
+              tail -n 3 evidence/guest-console.log || true
+            fi
+            sleep 5
+          done
+          if [ -s evidence/build.log ]; then
+            tail -n 35 evidence/build.log
+          fi
+          if [ ! -s evidence/result.txt ]; then
+            echo 'No build result received. Check console and receiver logs.' >&2
+            exit 1
+          fi
+          cat evidence/result.txt
+          grep -qx 'build_exit_code=0' evidence/result.txt
+          test -s evidence/softflowd-freebsd16-EXPERIMENTAL
+          echo 'Experimental FreeBSD 16 softflowd binary compiled and collected.'
+
+      - name: Upload diagnostic output and experimental binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd16-softflowd-build-EXPERIMENTAL-DO-NOT-INSTALL
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: warn
