@@ -1,0 +1,51 @@
+
+name: Inspect FreeBSD 16 softflowd binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download existing cross-built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: softflowd-FreeBSD16-CROSSBUILD-EXPERIMENTAL-NOT-PFSENSE-VALIDATED
+          run-id: 40219483084
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: binary
+
+      - name: Inspect target ABI and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=binary/softflowd-freebsd16-CROSSBUILD-EXPERIMENTAL
+          test -s "$BIN"
+
+          echo '=== Binary type ==='
+          file "$BIN"
+
+          echo '=== Required shared libraries ==='
+          readelf -d "$BIN" | grep NEEDED || true
+
+          echo '=== ELF interpreter ==='
+          readelf -l "$BIN" | grep 'Requesting program interpreter' || true
+
+          echo '=== FreeBSD ABI note ==='
+          readelf -n "$BIN" | head -60 || true
+
+          echo '=== Required versioned symbols ==='
+          readelf --version-info "$BIN" | tail -100 || true
+
+          echo '=== Undefined dynamic symbols ==='
+          readelf --dyn-syms --wide "$BIN" | grep ' UND ' | tail -100 || true
+
+          echo '=== SHA-256 ==='
+          sha256sum "$BIN"
