@@ -82,6 +82,8 @@ jobs:
           PUBKEY="$(cat vm/ephemeral_key.pub)"
           cat > vm/user-data <<EOF
           #cloud-config
+          package_update: false
+          package_upgrade: false
           users:
             - default
             - name: fypbuild
