@@ -1,0 +1,62 @@
+name: Prepare pfSense softflowd patched port
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-port:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out research repository
+        uses: actions/checkout@v4
+
+      - name: Verify Netgate recipe and upstream source; prepare patched port
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/out/softflowd/files work/original work/patched
+          BASE=https://raw.githubusercontent.com/pfsense/FreeBSD-ports/devel/net-mgmt/softflowd
+          curl -fsSL --retry 3 "$BASE/Makefile" -o work/Makefile.upstream
+          curl -fsSL --retry 3 "$BASE/distinfo" -o work/distinfo.upstream
+          grep -Eq '^PORTVERSION=[[:space:]]*1\.0\.0[[:space:]]*$' work/Makefile.upstream
+          grep -Eq '^PORTREVISION=[[:space:]]*1[[:space:]]*$' work/Makefile.upstream
+          grep -Eq '^SHA256 \(irino-softflowd-softflowd-1\.0\.0_GH0\.tar\.gz\) = 98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108$' work/distinfo.upstream
+          SOURCE=irino-softflowd-softflowd-1.0.0_GH0.tar.gz
+          curl -fsSL --retry 3 https://github.com/irino/softflowd/archive/refs/tags/softflowd-1.0.0.tar.gz -o "work/$SOURCE"
+          echo "98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108  work/$SOURCE" | sha256sum --check
+          tar -xf "work/$SOURCE" -C work/original --strip-components=1
+          cp -a work/original/. work/patched/
+          ( cd work/patched && git apply --check ../../patches/softflowd-bpf-timeout-1000ms.patch && git apply ../../patches/softflowd-bpf-timeout-1000ms.patch )
+          python3 - <<'PY'
+          from pathlib import Path
+          import difflib, re
+          original=Path('work/original/softflowd.c').read_text().splitlines(keepends=True)
+          patched=Path('work/patched/softflowd.c').read_text().splitlines(keepends=True)
+          changes=list(difflib.unified_diff(original,patched,fromfile='softflowd.c.orig',tofile='softflowd.c'))
+          assert sum('pcap_open_live (dev, snaplen, 1, 1000, ebuf)' in line and line.startswith('+') for line in changes) == 1
+          assert sum('pcap_open_live (dev, snaplen, 1, 0, ebuf)' in line and line.startswith('-') for line in changes) == 1
+          assert len([l for l in changes if l.startswith('@@')]) == 1, 'Unexpected patch breadth'
+          Path('work/out/softflowd/files/patch-softflowd.c').write_text(''.join(changes))
+          makefile=Path('work/Makefile.upstream').read_text()
+          new,n=re.subn(r'(?m)^PORTREVISION=[ \t]*1[ \t]*$', 'PORTREVISION=\t2', makefile)
+          assert n == 1
+          Path('work/out/softflowd/Makefile').write_text(new)
+          Path('work/out/softflowd/distinfo').write_text(Path('work/distinfo.upstream').read_text())
+          PY
+          ( cd work/original && patch --batch --dry-run -p0 -i ../out/softflowd/files/patch-softflowd.c )
+          printf '%s\n' 'PORTVERSION=1.0.0' 'BASE_PORTREVISION=1' 'EXPERIMENTAL_PORTREVISION=2' 'TARGET_ABI=FreeBSD:16:amd64' 'STATUS=PORT_OVERLAY_PREPARED_NOT_BUILT' > work/out/build-manifest.txt
+          sha256sum work/out/softflowd/Makefile work/out/softflowd/distinfo work/out/softflowd/files/patch-softflowd.c >> work/out/build-manifest.txt
+          printf '%s\n' 'EXPERIMENTAL PORT OVERLAY ONLY. NOT A BUILT PACKAGE. DO NOT INSTALL ON PFSENSE.' > work/out/README-DO-NOT-INSTALL.txt
+          cat work/out/build-manifest.txt
+
+      - name: Save validated port overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: softflowd-1.0.0_2-EXPERIMENTAL-PORT-OVERLAY-NOT-A-PACKAGE
+          path: work/out/
+          if-no-files-found: error
+          retention-days: 14
