@@ -30,8 +30,13 @@ jobs:
           echo "98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108  work/$SOURCE" | sha256sum --check
           tar -xf "work/$SOURCE" -C work/original --strip-components=1
           cp -a work/original/. work/patched/
-          ( cd work/patched && git apply --check ../../patches/softflowd-bpf-timeout-1000ms.patch && git apply ../../patches/softflowd-bpf-timeout-1000ms.patch )
-          python3 - <<'PY'
+          (
+          cd work/patched
+          patch --batch --dry-run -p1 \
+          < ../../patches/softflowd-bpf-timeout-1000ms.patch
+          patch --batch -p1 \
+          < ../../patches/softflowd-bpf-timeout-1000ms.patch
+          )
           from pathlib import Path
           import difflib, re
           original=Path('work/original/softflowd.c').read_text().splitlines(keepends=True)
