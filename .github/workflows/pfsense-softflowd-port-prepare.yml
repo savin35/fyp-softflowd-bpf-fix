@@ -37,6 +37,8 @@ jobs:
           patch --batch -p1 \
           < ../../patches/softflowd-bpf-timeout-1000ms.patch
           )
+          )
+          python3 - <<'PY'
           from pathlib import Path
           import difflib, re
           original=Path('work/original/softflowd.c').read_text().splitlines(keepends=True)
