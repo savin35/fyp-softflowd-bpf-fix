@@ -1,0 +1,77 @@
+name: Cross-build softflowd for FreeBSD 16 (experimental)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-18 lld-18 autoconf automake libtool pkg-config xz-utils patch file
+
+      - name: Fetch FreeBSD 16 sysroot and upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sysroot source evidence
+          curl -fL --retry 3 --connect-timeout 15 \
+            https://download.freebsd.org/snapshots/amd64/amd64/16.0-CURRENT/base.txz \
+            -o base.txz
+          tar -xJf base.txz -C sysroot
+          test -f sysroot/usr/include/pcap/pcap.h
+          test -e sysroot/usr/lib/libpcap.so
+          test -e sysroot/lib/libc.so.7
+          curl -fL --retry 3 \
+            https://github.com/irino/softflowd/archive/refs/tags/softflowd-1.0.0.tar.gz \
+            -o softflowd.tar.gz
+          echo '98aa66026d730211b45fe89670cd6ce50959846d536880b82f5afbca6281e108  softflowd.tar.gz' | sha256sum -c -
+          tar -xf softflowd.tar.gz -C source --strip-components=1
+          (
+            cd source
+            patch --batch -p1 < ../patches/softflowd-bpf-timeout-1000ms.patch
+          )
+          grep -Fq 'pcap_open_live (dev, snaplen, 1, 1000, ebuf)' source/softflowd.c
+          sha256sum base.txz softflowd.tar.gz > evidence/source-checksums.txt
+
+      - name: Cross-compile and inspect executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$PWD/sysroot"
+          cat > "$PWD/freebsd-cc" <<EOF
+          #!/bin/sh
+          exec clang-18 --target=x86_64-unknown-freebsd16.0 --sysroot="$ROOT" -fuse-ld=lld "\$@"
+          EOF
+          chmod +x freebsd-cc
+          export CC="$PWD/freebsd-cc"
+          export PKG_CONFIG=/bin/false
+          cd source
+          autoreconf -fi
+          ./configure --host=x86_64-unknown-freebsd16.0 --build=x86_64-pc-linux-gnu \
+            CPPFLAGS="-I$ROOT/usr/include" \
+            LDFLAGS="-L$ROOT/usr/lib -L$ROOT/lib"
+          make -j2 V=1
+          test -s softflowd
+          cp softflowd ../evidence/softflowd-freebsd16-CROSSBUILD-EXPERIMENTAL
+          file softflowd | tee ../evidence/binary-type.txt
+          readelf -h -l -d softflowd > ../evidence/elf-report.txt
+          sha256sum softflowd > ../evidence/binary-sha256.txt
+          echo 'Cross-build succeeded. NOT validated on pfSense. DO NOT INSTALL.' > ../evidence/README-DO-NOT-INSTALL.txt
+
+      - name: Save binary and diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: softflowd-FreeBSD16-CROSSBUILD-EXPERIMENTAL-NOT-PFSENSE-VALIDATED
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
